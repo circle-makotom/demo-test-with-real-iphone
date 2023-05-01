@@ -1,0 +1,153 @@
+version: 2.1
+
+executors:
+  m1-self-hosted:
+    machine: true
+    resource_class: makotom-2021/mbp-m1 ##### This value needs to be updated accordingly!
+
+  m1-circleci:
+    macos:
+      xcode: 14.2.0
+    resource_class: macos.m1.large.gen1
+
+jobs:
+  build:
+    parameters:
+      executor:
+        type: string
+
+      platform:
+        type: string
+      ios-version:
+        type: string
+        default: ""
+      device-name:
+        type: string
+
+    executor: << parameters.executor >>
+
+    steps:
+      - run:
+          name: Show basic system profile
+          command: system_profiler SPHardwareDataType SPSoftwareDataType
+      - run:
+          name: List devices
+          command: xctrace list devices
+
+      - checkout
+
+      - when:
+          condition:
+            equal:
+              - << parameters.platform >>
+              - iOS Simulator
+          steps:
+            - run:
+                name: Boot Simulator for tests
+                command: |
+                  set -x
+
+                  runtimeIdentifier="$(xcrun simctl list runtimes -j | jq -r '.runtimes[] | select(.platform == "iOS") | select(.version == $ENV.XC_DEST_OS) | .identifier')"
+                  deviceTypeIdentifier="$(xcrun simctl list runtimes -j | jq -r '.runtimes[] | select(.identifier == "'"${runtimeIdentifier}"'") | .supportedDeviceTypes[] | select(.name == $ENV.XC_DEST_NAME) | .identifier')"
+                  udid="$(xcrun simctl list devices -j | jq -r '.devices."'"${runtimeIdentifier}"'"[] | select(.deviceTypeIdentifier == "'"${deviceTypeIdentifier}"'") | .udid')"
+
+                  xcrun simctl shutdown "${udid}" || true
+                  xcrun simctl boot "${udid}"
+                environment:
+                  XC_DEST_PLATFORM: << parameters.platform >>
+                  XC_DEST_OS: << parameters.ios-version >>
+                  XC_DEST_NAME: << parameters.device-name >>
+
+      - when:
+          condition:
+            equal:
+              - << parameters.platform >>
+              - iOS
+          steps:
+            - run:
+                name: Ensure certificates and profiles for code signing
+                command: |
+                  # Download keypairs
+                  # NOTE: Storing them on Gist without passphrase is truly insecure, DO NOT MIMIC THIS! CONSIDER ABOUT USING FASTLANE!
+                  curl -JOL https://gist.github.com/makotom/01e4bbbcc1f3f39054b3adada044bc9e/raw/privkey_dev.pem
+                  curl -JOL https://gist.github.com/makotom/01e4bbbcc1f3f39054b3adada044bc9e/raw/privkey_dist.pem
+                  curl -JOL https://gist.github.com/makotom/01e4bbbcc1f3f39054b3adada044bc9e/raw/ios_development.cer
+                  curl -JOL https://gist.github.com/makotom/01e4bbbcc1f3f39054b3adada044bc9e/raw/ios_distribution.cer
+                  curl -o chain.cer -JL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer # EDIT: The intermediate CA for 2 CERs above; choose the one that fits into yours from https://www.apple.com/certificateauthority/
+
+                  # Initialize a keychain
+                  security create-keychain -p "" ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain"
+                  security unlock-keychain -p "" ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain"
+
+                  # Import keypairs
+                  security import privkey_dev.pem -k ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain" -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/productbuild -T /usr/bin/productsign
+                  security import privkey_dist.pem -k ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain" -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/productbuild -T /usr/bin/productsign
+                  security import ios_distribution.cer -k ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain" -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/productbuild -T /usr/bin/productsign
+                  security import ios_development.cer -k ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain" -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/productbuild -T /usr/bin/productsign
+                  security import chain.cer -k ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain" -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/productbuild -T /usr/bin/productsign
+
+                  # Configure the keychain to be usable for headless code signing
+                  security list-keychains -d user -s ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain" ~/Library/Keychains/login.keychain
+                  security set-key-partition-list -S apple-tool:,apple:,codesign: -k "" ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain"
+
+                  security find-identity -p codesigning
+
+                  # Download provisioning profiles
+                  # NOTE: Storing them on Gist without passphrase is truly insecure, DO NOT MIMIC THIS! CONSIDER ABOUT USING FASTLANE!
+                  curl -JOL https://gist.github.com/makotom/01e4bbbcc1f3f39054b3adada044bc9e/raw/Demo_dev_profile_for_Makoto.mobileprovision
+                  curl -JOL https://gist.github.com/makotom/01e4bbbcc1f3f39054b3adada044bc9e/raw/Demo_dist_profile_for_Makoto.mobileprovision
+
+                  # Install the profiles
+                  mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+                  mv *.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles
+
+      - run:
+          name: Resolve dependencies 👉 Run UI tests
+          command: |
+            # Resolve dependencies as needed
+            xcodebuild -resolvePackageDependencies -scheme CircleCIDemoUITests
+
+            # Determine destination
+            if [[ "${XC_DEST_PLATFORM}" == "iOS Simulator" ]]; then
+                destination="platform=${XC_DEST_PLATFORM},OS=${XC_DEST_OS},name=${XC_DEST_NAME}"
+            elif [[ "${XC_DEST_PLATFORM}" == "iOS" ]]; then
+                destination="platform=${XC_DEST_PLATFORM},name=${XC_DEST_NAME}"
+            fi
+
+            # Run tests, and pipe the output into xcpretty to yield JUnit-based test data
+            xcodebuild -scheme CircleCIDemoUITests -destination "${destination}" build test | tee /dev/stderr | xcpretty --report junit --output test-results.xml
+          environment:
+            XC_DEST_PLATFORM: << parameters.platform >>
+            XC_DEST_OS: << parameters.ios-version >>
+            XC_DEST_NAME: << parameters.device-name >>
+
+      - when:
+          condition:
+            equal:
+              - << parameters.platform >>
+              - iOS
+          steps:
+            - run:
+                name: Delete keychain
+                command: security delete-keychain ~/Library/Keychains/"${CIRCLE_PROJECT_REPONAME}.${CIRCLE_BUILD_NUM}.keychain"
+
+      - store_test_results:
+          path: test-results.xml
+
+workflows:
+  run:
+    jobs:
+      # A job running on a self-hosted runner
+      - build:
+          name: build - m1-self-hosted
+          executor: m1-self-hosted
+          platform: iOS
+          device-name: makotom runs a demo on this iPhone 8
+
+      # A job running on a CircleCI-managed executor
+      - build:
+          name: build - m1-circleci
+          executor: m1-circleci
+          platform: iOS Simulator
+          ios-version: "16.2"
+          device-name: iPhone 14
